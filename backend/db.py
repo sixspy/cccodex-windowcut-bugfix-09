@@ -83,7 +83,8 @@ CREATE TABLE IF NOT EXISTS materializations(
   row_count INTEGER NOT NULL,
   total_amount REAL NOT NULL,
   partition_key TEXT,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  generation INTEGER NOT NULL DEFAULT 1
 );
 CREATE TABLE IF NOT EXISTS hold_staging(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -241,7 +242,9 @@ def seed_if_empty(conn: sqlite3.Connection) -> None:
                 ),
             )
     conn.execute(
-        "INSERT INTO materializations(window_id,status,row_count,total_amount,partition_key,created_at) VALUES (?,?,?,?,?,?)",
+        """INSERT INTO materializations(window_id,status,row_count,total_amount,
+                                        partition_key,created_at,generation)
+           VALUES (?,?,?,?,?,?,1)""",
         (1, "成功", 1, 12.5, "W-1101-g1", "2026-11-02T00:10:00"),
     )
     conn.execute(
@@ -250,10 +253,73 @@ def seed_if_empty(conn: sqlite3.Connection) -> None:
     )
 
 
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def _index_names(conn: sqlite3.Connection) -> set[str]:
+    return {r["name"] for r in conn.execute("PRAGMA index_list(materializations)")}
+
+
+def migrate_materializations(conn: sqlite3.Connection) -> None:
+    """同代去重迁移（同一 SQLite 文件内幂等执行，不换仓）。
+
+    1. 补 generation 列并按窗口代际回填；
+    2. 切断历史幽灵：同 (window_id, generation) 多条「成功」时保留最早一条，
+       其余原地标「作废」并写 materialize_ghost_cutoff 审计（甲路径纠偏，
+       不是乙路径的新单作废旧单）；
+    3. 建部分唯一索引，硬保证同窗同代仅一条成功。
+    """
+    if "generation" not in _table_columns(conn, "materializations"):
+        conn.execute("ALTER TABLE materializations ADD COLUMN generation INTEGER NOT NULL DEFAULT 1")
+    conn.execute(
+        """UPDATE materializations
+           SET generation=(SELECT COALESCE(MAX(w.generation),1)
+                           FROM windows w WHERE w.id=materializations.window_id)
+           WHERE generation IS NULL OR generation=0"""
+    )
+
+    ghosts = conn.execute(
+        """SELECT m.id, m.window_id, m.generation
+           FROM materializations m
+           WHERE m.status='成功'
+             AND m.id NOT IN (
+                   SELECT MIN(id) FROM materializations
+                   WHERE status='成功'
+                   GROUP BY window_id, generation
+                 )
+           ORDER BY m.window_id, m.generation, m.id"""
+    ).fetchall()
+    for g in ghosts:
+        conn.execute(
+            "UPDATE materializations SET status='作废' WHERE id=?", (g["id"],)
+        )
+        write_audit(
+            conn,
+            "system",
+            "materialize_ghost_cutoff",
+            str(g["window_id"]),
+            {
+                "materialization_id": g["id"],
+                "generation": g["generation"],
+                "reason": "幽灵偏了：同代多条成功，按甲路径保留最早一条，余者标作废",
+                "path": "甲-二次插入拒绝",
+            },
+        )
+
+    if "ux_materializations_success_per_generation" not in _index_names(conn):
+        conn.execute(
+            """CREATE UNIQUE INDEX ux_materializations_success_per_generation
+                   ON materializations(window_id, generation)
+                   WHERE status='成功'"""
+        )
+
+
 def init_db() -> None:
     with connect() as conn:
         conn.executescript(SCHEMA)
         ensure_users(conn)
+        migrate_materializations(conn)
         seed_if_empty(conn)
         conn.commit()
 

@@ -1,6 +1,7 @@
 """窗口锁与争用登记（公共并发面，题面争用句应对得上）。"""
 from __future__ import annotations
 
+import sqlite3
 from datetime import datetime
 
 from fastapi import APIRouter, HTTPException
@@ -23,11 +24,24 @@ def try_acquire(conn, lock_key: str, holder: str) -> bool:
         "SELECT holder FROM window_locks WHERE lock_key=?", (lock_key,)
     ).fetchone()
     if row is None:
-        conn.execute(
-            "INSERT INTO window_locks(lock_key,holder,acquired_at) VALUES (?,?,?)",
-            (lock_key, holder, now),
-        )
-        return True
+        try:
+            conn.execute(
+                "INSERT INTO window_locks(lock_key,holder,acquired_at) VALUES (?,?,?)",
+                (lock_key, holder, now),
+            )
+            return True
+        except sqlite3.IntegrityError:
+            # 真实并发：两个连接同插一个锁键，后到者撞主键，按争用处理。
+            conn.rollback()
+            row = conn.execute(
+                "SELECT holder FROM window_locks WHERE lock_key=?", (lock_key,)
+            ).fetchone()
+            conn.execute(
+                """INSERT INTO contention_log(lock_key,actor,action,detail,created_at)
+                   VALUES (?,?,?,?,?)""",
+                (lock_key, holder, "争用", f"持有者={row['holder'] if row else '未知'}", now),
+            )
+            return False
     if row["holder"] == holder:
         return True
     conn.execute(

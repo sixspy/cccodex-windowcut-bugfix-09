@@ -46,7 +46,10 @@ def dashboard(authorization: AuthHeader = None):
         hold_n = conn.execute(
             "SELECT COUNT(*) c FROM hold_staging WHERE status='暂存'"
         ).fetchone()["c"]
-        mats = conn.execute("SELECT COUNT(*) c FROM materializations").fetchone()["c"]
+        # BUGFIX-09：物化单计数只算有效「成功」，作废/幽灵不充数。
+        mats = conn.execute(
+            "SELECT COUNT(*) c FROM materializations WHERE status='成功'"
+        ).fetchone()["c"]
         contention = conn.execute("SELECT COUNT(*) c FROM contention_log").fetchone()["c"]
         return {
             "open_windows": open_n,

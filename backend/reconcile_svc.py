@@ -21,10 +21,15 @@ def reconcile(wid: int, authorization: AuthHeader = None):
                FROM events WHERE window_id=? AND disposition='窗内'""",
             (wid,),
         ).fetchone()
-        # BUGFIX-09 埋雷：只读最新行，掩盖幽灵旧成功
+        # BUGFIX-09 修复：只认同代唯一「成功」行；作废/幽灵行不得进入对账。
+        # 取最早一条与甲路径「保留最早一条」的切断规则一致。
         mat = conn.execute(
-            "SELECT * FROM materializations WHERE window_id=? ORDER BY id DESC LIMIT 1",
-            (wid,),
+            """SELECT * FROM materializations
+               WHERE window_id=? AND status='成功'
+                 AND generation=(SELECT COALESCE(MAX(generation),1)
+                                 FROM materializations WHERE window_id=?)
+               ORDER BY id ASC LIMIT 1""",
+            (wid, wid),
         ).fetchone()
         late = conn.execute(
             "SELECT COUNT(*) c FROM late_bucket WHERE window_name=?",
@@ -63,8 +68,12 @@ def reconcile_all(authorization: AuthHeader = None):
                 (w["id"],),
             ).fetchone()
             mat = conn.execute(
-                "SELECT * FROM materializations WHERE window_id=? ORDER BY id DESC LIMIT 1",
-                (w["id"],),
+                """SELECT * FROM materializations
+                   WHERE window_id=? AND status='成功'
+                     AND generation=(SELECT COALESCE(MAX(generation),1)
+                                     FROM materializations WHERE window_id=?)
+                   ORDER BY id ASC LIMIT 1""",
+                (w["id"], w["id"]),
             ).fetchone()
             late = conn.execute(
                 "SELECT COUNT(*) c FROM late_bucket WHERE window_name=?",
